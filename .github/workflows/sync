@@ -1,0 +1,98 @@
+# ==============================================================================
+# 【通用模板】Fork 仓库自动同步 + TG 结果通知（调用统一模板）
+# 功能：1. 定时/手动同步 Fork 仓库与上游 2. 同步结果调用 TG 模板推送
+# 适配场景：所有 Fork 仓库的自动同步需求，无需重复编写 TG 推送逻辑
+# 配置项：仅需修改 UPSTREAM_REPO 为实际上游仓库地址
+# ==============================================================================
+name: Fork Sync + TG Notify (Universal)
+
+# 权限配置：同步代码需要写入权限，调用模板需要读取权限
+permissions:
+  contents: write  # 推送同步后的代码到 Fork 仓库
+  actions: read    # 调用外部模板仓库的工作流
+
+# 触发条件：定时执行 + 手动触发（兼顾自动/手动需求）
+on:
+  # 定时触发：每天 UTC 0 点（北京时间 8 点）执行，可修改 cron 表达式
+  schedule:
+    - cron: "0 0 * * *"
+  # 手动触发：支持自定义同步分支，适配临时同步需求
+  workflow_dispatch:
+    inputs:
+      target_branch:
+        description: 'Fork 仓库目标同步分支'
+        required: false
+        default: 'main'
+      upstream_branch:
+        description: '上游仓库源分支'
+        required: false
+        default: 'main'
+
+# 全局常量（集中管理，便于修改）
+env:
+  # 【必改项】替换为你的上游仓库地址（格式：用户名/仓库名）
+  UPSTREAM_REPO: "ai-tmarks/tmarks"
+
+jobs:
+  # 任务1：执行 Fork 仓库同步
+  sync-fork-with-upstream:
+    name: Sync Fork Repository
+    runs-on: ubuntu-latest
+    # 仅当当前仓库是 Fork 仓库时执行（避免非 Fork 仓库误触发）
+    if: ${{ github.event.repository.fork }}
+    # 输出同步结果，供 TG 通知步骤使用
+    outputs:
+      sync_status: ${{ steps.check-sync-result.outputs.status }}
+      sync_message: ${{ steps.check-sync-result.outputs.message }}
+      repo_name: ${{ github.repository }}
+      target_branch: ${{ github.event.inputs.target_branch || 'main' }}
+
+    steps:
+      - name: Checkout Fork Repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}  # GitHub 自动生成的临时令牌
+          fetch-depth: 0                      # 拉取完整提交历史，确保同步完整
+
+      - name: Sync with Upstream Repository
+        id: sync-step
+        continue-on-error: true  # 同步失败不终止，继续执行通知步骤
+        uses: aormsby/Fork-Sync-With-Upstream-action@v3.4
+        with:
+          target_repo_token: ${{ secrets.GITHUB_TOKEN }}
+          upstream_sync_repo: ${{ env.UPSTREAM_REPO }}
+          upstream_sync_branch: ${{ github.event.inputs.upstream_branch }}
+          target_sync_branch: ${{ github.event.inputs.target_branch }}
+          test_mode: false  # 生产环境设为 false，测试时可设为 true（仅模拟不推送）
+
+      - name: Check Sync Result
+        id: check-sync-result
+        run: |
+          # 判断同步结果，生成标准化消息
+          if [ "${{ steps.sync-step.outcome }}" = "success" ]; then
+            echo "status=成功" >> $GITHUB_OUTPUT
+            echo "message=仓库【${{ github.repository }}】分支【${{ github.event.inputs.target_branch || 'main' }}】同步上游成功！" >> $GITHUB_OUTPUT
+            echo "✅ Fork 同步完成"
+          else
+            echo "status=失败" >> $GITHUB_OUTPUT
+            echo "message=仓库【${{ github.repository }}】分支【${{ github.event.inputs.target_branch || 'main' }}】同步上游失败！可能原因：1.合并冲突 2.上游仓库地址错误 3.网络问题" >> $GITHUB_OUTPUT
+            echo "❌ Fork 同步失败"
+          fi
+
+  # 任务2：调用 TG 模板推送同步结果
+  send-tg-notification:
+    name: Send Sync Result to TG
+    runs-on: ubuntu-latest
+    needs: sync-fork-with-upstream  # 依赖同步任务完成
+    steps:
+      - name: Call Reusable TG Template
+        # 【必改项】替换为你的模板仓库地址（格式：用户名/模板仓库名@分支）
+        uses: "Wliky/pusher/.github/workflows/telegram.yml@main"
+        with:
+          # 动态生成通知标题（包含同步状态）
+          notify_title: "🔄 Fork仓库同步${{ needs.sync-fork-with-upstream.outputs.sync_status }}"
+          # 动态生成通知内容（包含仓库信息+链接）
+          notify_content: |
+            ${{ needs.sync-fork-with-upstream.outputs.sync_message }}
+            🔗 仓库地址：https://github.com/${{ needs.sync-fork-with-upstream.outputs.repo_name }}
+            🌿 同步分支：${{ needs.sync-fork-with-upstream.outputs.target_branch }}
